@@ -7,10 +7,10 @@ import bsdiff4
 
 from diachronic.conf import DEFAULT_PATH
 
-WIKI_PATH = DEFAULT_PATH + "enwiki-20170901-pages-meta-history1.xml-p10p2123.7z"
-OUTPUT_PATH = DEFAULT_PATH + "test.7z"
+WIKI_PATH = DEFAULT_PATH + "enwiki-20170901-pages-meta-history27.xml-p42663462p42922763.7z"
+OUTPUT_PATH = DEFAULT_PATH + "bigtest.gzip"
 WIKI_NS = "{http://www.mediawiki.org/xml/export-0.10/}"
-REVISION_POWER = 1.11
+REVISION_POWER = 1.1
 MAX_REVISION = 1E9
 BUFF_SIZE = 1E8
 
@@ -24,7 +24,7 @@ def nstag(tag: str) -> str:
 
 
 def wiki_gen(stream) -> Tuple[str, Element]:
-    for event, elem in etree.iterparse(stream.stdout, events=("end", ), tag=WIKI_NS+"page"):
+    for event, elem in etree.iterparse(stream.stdout):
         yield event, elem
 
 
@@ -45,35 +45,52 @@ def make_valid_indexes(rev_power: float=REVISION_POWER, max_index: int=MAX_REVIS
 
 
 def run():
-    buff = bytes()
+    global_buffer = bytes()
+    local_buffer = bytes()
     count = 0
     valid_indexes = make_valid_indexes()
+    current_revision = None
+    rev_index = 0
+    revs_parsed = 0
     with gzip.open(OUTPUT_PATH, 'wb') as f:
         for event, elem in wiki_gen(wiki_stream(WIKI_PATH)):
-            count+=1
-            if len(buff) > BUFF_SIZE:
-                print("Writing buffer...")
-                f.write(buff)
-                print("Buffer flushed")
-                buff = ""
-            title = elem.find(nstag("title")).text
-            print(count, title, len(buff), len(buff)/BUFF_SIZE)
-            revisions = ((child.find(nstag("timestamp")).text, child.find(nstag("text")).text)
-                         for i, child in enumerate(elem.iter(nstag("revision")))
-                         if i in valid_indexes)
-            past = bytes(next(revisions)[1] or "", 'UTF-8')
-            buff += past
-            for tstamp, text in revisions:
-                cur = bytes(text or "", 'UTF-8')
-                if past and cur:
-                    diffs = bsdiff4.diff(past, cur)
-                    buff += diffs
-                past = cur
+            tag = ltag(elem)
+            if tag == "revision":
+                if rev_index in valid_indexes:
+                    text = bytes(elem.find(nstag("text")).text or "", 'UTF-8')
+                    if rev_index == 0:
+                        current_revision = text
+                        local_buffer += text
+                    else:
+                        local_buffer += bsdiff4.diff(current_revision, text)
+                        current_revision = text
+                    revs_parsed += 1
+                rev_index += 1
+            elif tag == "title":
+                title = elem.text
+            elif tag == "page":
+                global_buffer += bytes(title, 'UTF-8') + local_buffer
+                print(count, title, rev_index + 1, revs_parsed, len(global_buffer)/BUFF_SIZE)
+
+                count += 1
+                current_revision = None
+                rev_index = 0
+                revs_parsed = 0
+                local_buffer = bytes()
+
+                if len(global_buffer) > BUFF_SIZE:
+                    print("Writing buffer...")
+                    f.write(global_buffer)
+                    print("Buffer flushed")
+                    global_buffer = bytes()
+
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
+
             elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
+
         print("Final write")
-        f.write(buff)
+        f.write(global_buffer)
 
 
 if __name__ == "__main__":

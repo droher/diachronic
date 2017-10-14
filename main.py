@@ -7,9 +7,8 @@ from lxml.etree import Element
 import urllib.request
 import json
 import shutil
-import gzip
+import pyarrow as pa
 import bsdiff4
-
 
 from diachronic.conf import DEFAULT_PATH
 
@@ -80,7 +79,7 @@ class Diachronic(object):
 
         print("Running", wiki_path)
         global_buffer = bytes()
-        local_buffer = bytes()
+        arr = pa.array()
         current_revision = None
         rev_index = 0
         print("Making valid indices", wiki_path)
@@ -89,7 +88,7 @@ class Diachronic(object):
         stdout = Popen(["7z", "e", "-so", wiki_path], stdout=PIPE).stdout
         starting = True
 
-        with gzip.open(output_path, 'wb') as f:
+        with pa.OSFile(output_path, 'wb') as f:
             for event, elem in etree.iterparse(stdout):
                 if starting:
                     print("Starting read", wiki_path)

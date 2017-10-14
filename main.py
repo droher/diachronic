@@ -1,13 +1,16 @@
-from subprocess import Popen, PIPE
-from multiprocessing import Pool
+import json
 import os
+import shutil
+import urllib.request
 from enum import Enum
+from multiprocessing import Pool
+from subprocess import Popen, PIPE
+from timeit import default_timer as timer
+
 from lxml import etree
 from lxml.etree import Element
-import urllib.request
-import json
-import shutil
 import pyarrow as pa
+import pyarrow.parquet as pq
 import bsdiff4
 
 from diachronic.conf import DEFAULT_PATH
@@ -28,6 +31,7 @@ class Tags(Enum):
     Timestamp = "timestamp"
     Title = "title"
     Text = "text"
+    Namespace = "ns"
 
     @property
     def nstag(self) -> str:
@@ -67,65 +71,75 @@ class Diachronic(object):
         return s
 
     def run(self, wiki_file):
-        print("Downloading", wiki_file)
-        response = urllib.request.urlopen(URL_PREFIX + wiki_file)
-        download_file = open(DEFAULT_PATH + wiki_file, 'wb')
-        shutil.copyfileobj(response, download_file)
-        response.close()
-        download_file.close()
-        print("Downloaded", wiki_file)
+        if not os.path.exists(DEFAULT_PATH + wiki_file):
+            start = timer()
+            response = urllib.request.urlopen(URL_PREFIX + wiki_file)
+            download_file = open(DEFAULT_PATH + wiki_file, 'wb')
+            shutil.copyfileobj(response, download_file)
+            response.close()
+            download_file.close()
+            end = timer()
+            print("Downloaded {} in {} minutes".format(wiki_file, round((end - start) / 60, 2)))
+        start = timer()
         wiki_path = DEFAULT_PATH + wiki_file
-        output_path = OUTPUT_PATH + wiki_file + ".gz"
+        output_path = OUTPUT_PATH + wiki_file + ".parquet"
 
-        print("Running", wiki_path)
-        global_buffer = bytes()
-        arr = pa.array()
+        # Parquet Table Columns
+        arrow_cols = ("namespace", "title", "initial_text",
+                      "initial_timestamp", "diff_timestamps", "diffs")
+        arrow_buff = {colname: [] for colname in arrow_cols}
+
+        # Tracking iterations
+        arrow_row = {colname: None for colname in arrow_cols}
         current_revision = None
         rev_index = 0
-        print("Making valid indices", wiki_path)
+
         valid_indexes = self.make_valid_indexes()
-        print("Opening Popen", wiki_path)
         stdout = Popen(["7z", "e", "-so", wiki_path], stdout=PIPE).stdout
-        starting = True
+        for event, elem in etree.iterparse(stdout):
+            tag = elem.tag
+            if tag == Tags.Revision.nstag:
+                if rev_index in valid_indexes and arrow_row["namespace"] == "0":
+                    text = elem.find(Tags.Text.nstag).text or ""
+                    text_bytes = bytes(text, "UTF-8")
+                    timestamp = elem.find(Tags.Timestamp.nstag).text
+                    if rev_index == 0:
+                        current_revision = text_bytes
+                        arrow_row["initial_text"] = text
+                        arrow_row["initial_timestamp"] = timestamp
+                        arrow_row["diff_timestamps"] = []
+                        arrow_row["diffs"] = []
+                    else:
+                        arrow_row["diffs"].append(bsdiff4.diff(current_revision, text_bytes))
+                        arrow_row["diff_timestamps"].append(timestamp)
+                        current_revision = text_bytes
+                rev_index += 1
+                elem.clear()
+            elif tag == Tags.Namespace.nstag:
+                arrow_row["namespace"] = elem.text
+            elif tag == Tags.Page.nstag:
+                arrow_row["title"] = elem.find(Tags.Title.nstag).text
+                # Write to buffer and reset trackers
+                if arrow_row["namespace"] == '0':
+                    for col, val in arrow_row.items():
+                        arrow_buff[col].append(val)
+                arrow_row = {colname: None for colname in arrow_cols}
+                current_revision = None
+                rev_index = 0
 
-        with pa.OSFile(output_path, 'wb') as f:
-            for event, elem in etree.iterparse(stdout):
-                if starting:
-                    print("Starting read", wiki_path)
-                    starting = False
-                tag = elem.tag
-                if tag == Tags.Revision.nstag:
-                    if rev_index in valid_indexes:
-                        text = bytes(elem.find(Tags.Text.nstag).text or "", 'UTF-8')
-                        if rev_index == 0:
-                            current_revision = text
-                            local_buffer += text
-                        else:
-                            local_buffer += bsdiff4.diff(current_revision, text)
-                            current_revision = text
-                    rev_index += 1
-                elif tag == Tags.Title.nstag:
-                    title = elem.text
-                elif tag == Tags.Page.nstag:
-                    global_buffer += bytes(title, 'UTF-8') + local_buffer
-                    current_revision = None
-                    rev_index = 0
-                    local_buffer = bytes()
-
-                    if len(global_buffer) > BUFF_SIZE:
-                        f.write(global_buffer)
-                        global_buffer = bytes()
-
-                    while elem.getprevious() is not None:
-                        del elem.getparent()[0]
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
 
                 elem.clear()
 
-            f.write(global_buffer)
-        print("Finished running", wiki_path)
+        arrow_arrays = {colname: pa.array(arr) for colname, arr in arrow_buff.items()}
+        arrow_table = pa.Table.from_arrays(arrays=list(arrow_arrays.values()), names=list(arrow_arrays.keys()))
+        pq.write_table(arrow_table, output_path, compression='brotli')
+        end = timer()
         os.remove(DEFAULT_PATH + wiki_file)
-        return wiki_path
-
+        print("Finished {} with shape {} in {} minutes".format(wiki_file,
+                                                               arrow_table.shape, round((end - start) / 60, 2)))
+        return wiki_file
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ from enum import Enum
 from multiprocessing import Pool
 from subprocess import Popen, PIPE
 from timeit import default_timer as timer
+from dateutil.parser import parse as dateparse
+from datetime import datetime, timedelta
 
 from lxml import etree
 from lxml.etree import Element
@@ -15,14 +17,14 @@ import bsdiff4
 
 from diachronic.conf import DEFAULT_PATH
 
-URL_PREFIX = "http://dumps.wikimedia.your.org/enwiki/20170901/"
-WIKI_PATH = DEFAULT_PATH + "enwiki-20170901-pages-meta-history27.xml-p42663462p42922763.7z"
+DATE_INIT = datetime(2001, 1, 15, 0, 0, 0)
+MONTH = '20171001'
+URL_PREFIX = "http://dumps.wikimedia.your.org/enwiki/{}/".format(MONTH)
 OUTPUT_PATH = DEFAULT_PATH + "outfiles/"
 WIKI_NS = "{http://www.mediawiki.org/xml/export-0.10/}"
 REVISION_POWER = 1.1
 MAX_REVISION = 1E9
 BUFF_SIZE = 1E8
-THREADS = 4
 
 
 class Tags(Enum):
@@ -50,25 +52,13 @@ class Diachronic(object):
         json_url = urllib.request.urlopen("{}dumpstatus.json".format(URL_PREFIX))
         data = json.loads(json_url.read().decode())
         json_url.close()
-        filenames = data["jobs"]["metahistory7zdump"]["files"].keys()
+        filenames = list(data["jobs"]["metahistory7zdump"]["files"].keys())
         pool = Pool()
-        for filename in filenames:
+        for filename in filenames[:1]:
             pool.apply_async(self.run, (filename, ))
         pool.close()
         pool.join()
         return 1
-
-    @staticmethod
-    def make_valid_indexes(rev_power: float=REVISION_POWER, max_index: int=MAX_REVISION):
-        s = {0}
-        index = 0
-        for i in range(int(max_index)):
-            new_index = int(min(max_index - 1, max(index + 1, rev_power ** i)))
-            if new_index <= index:
-                break
-            s.add(new_index)
-            index = new_index
-        return s
 
     def run(self, wiki_file):
         if not os.path.exists(DEFAULT_PATH + wiki_file):
@@ -92,18 +82,18 @@ class Diachronic(object):
         # Tracking iterations
         arrow_row = {colname: None for colname in arrow_cols}
         current_revision = None
-        rev_index = 0
+        cur_date = DATE_INIT
 
-        valid_indexes = self.make_valid_indexes()
         stdout = Popen(["7z", "e", "-so", wiki_path], stdout=PIPE).stdout
         for event, elem in etree.iterparse(stdout):
             tag = elem.tag
             if tag == Tags.Revision.nstag:
-                if rev_index in valid_indexes and arrow_row["namespace"] == "0":
+                timestamp = dateparse(elem.find(Tags.Timestamp.nstag).text, ignoretz=True)
+                if timestamp >= cur_date and arrow_row["namespace"] == "0":
+                    cur_date = datetime.combine(timestamp.date(), datetime.min.time()) + timedelta(days=1)
                     text = elem.find(Tags.Text.nstag).text or ""
                     text_bytes = bytes(text, "UTF-8")
-                    timestamp = elem.find(Tags.Timestamp.nstag).text
-                    if rev_index == 0:
+                    if not current_revision:
                         current_revision = text_bytes
                         arrow_row["initial_text"] = text
                         arrow_row["initial_timestamp"] = timestamp
@@ -113,7 +103,6 @@ class Diachronic(object):
                         arrow_row["diffs"].append(bsdiff4.diff(current_revision, text_bytes))
                         arrow_row["diff_timestamps"].append(timestamp)
                         current_revision = text_bytes
-                rev_index += 1
                 elem.clear()
             elif tag == Tags.Namespace.nstag:
                 arrow_row["namespace"] = elem.text
@@ -125,7 +114,7 @@ class Diachronic(object):
                         arrow_buff[col].append(val)
                 arrow_row = {colname: None for colname in arrow_cols}
                 current_revision = None
-                rev_index = 0
+                cur_date = DATE_INIT
 
                 while elem.getprevious() is not None:
                     del elem.getparent()[0]

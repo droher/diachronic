@@ -1,1 +1,1 @@
-DEFAULT_PATH = "/Users/davidroher/Downloads/"
+DEFAULT_PATH = "/home/david_roher/Downloads/"

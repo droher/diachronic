@@ -14,6 +14,7 @@ from lxml.etree import Element
 import pyarrow as pa
 import pyarrow.parquet as pq
 import bsdiff4
+from google.cloud import storage
 
 from diachronic.conf import DEFAULT_PATH
 
@@ -25,6 +26,7 @@ WIKI_NS = "{http://www.mediawiki.org/xml/export-0.10/}"
 REVISION_POWER = 1.1
 MAX_REVISION = 1E9
 BUFF_SIZE = 1E8
+BUCKET_NAME = ""
 
 
 class Tags(Enum):
@@ -54,25 +56,31 @@ class Diachronic(object):
         json_url.close()
         filenames = list(data["jobs"]["metahistory7zdump"]["files"].keys())
         pool = Pool()
-        for filename in filenames[:1]:
-            pool.apply_async(self.run, (filename, ))
+        client = storage.Client()
+        bucket = client.get_bucket(BUCKET_NAME)
+
+        for filename in filenames:
+            if not bucket.blob(filename + ".parquet").exists():
+                pool.apply_async(self.run, (filename, ))
+            else:
+                print("Skipping", filename)
         pool.close()
         pool.join()
         return 1
 
     def run(self, wiki_file):
-        if not os.path.exists(DEFAULT_PATH + wiki_file):
-            start = timer()
-            response = urllib.request.urlopen(URL_PREFIX + wiki_file)
-            download_file = open(DEFAULT_PATH + wiki_file, 'wb')
-            shutil.copyfileobj(response, download_file)
-            response.close()
-            download_file.close()
-            end = timer()
-            print("Downloaded {} in {} minutes".format(wiki_file, round((end - start) / 60, 2)))
+        start = timer()
+        response = urllib.request.urlopen(URL_PREFIX + wiki_file)
+        download_file = open(DEFAULT_PATH + wiki_file, 'wb')
+        shutil.copyfileobj(response, download_file)
+        response.close()
+        download_file.close()
+        end = timer()
+        print("Downloaded {} in {} minutes".format(wiki_file, round((end - start) / 60, 2)))
+
         start = timer()
         wiki_path = DEFAULT_PATH + wiki_file
-        output_path = OUTPUT_PATH + wiki_file + ".parquet"
+        output_filename = wiki_file + ".parquet"
 
         # Parquet Table Columns
         arrow_cols = ("namespace", "title", "initial_text",
@@ -123,9 +131,18 @@ class Diachronic(object):
 
         arrow_arrays = {colname: pa.array(arr) for colname, arr in arrow_buff.items()}
         arrow_table = pa.Table.from_arrays(arrays=list(arrow_arrays.values()), names=list(arrow_arrays.keys()))
-        pq.write_table(arrow_table, output_path, compression='brotli')
+        pq.write_table(arrow_table, OUTPUT_PATH + output_filename, compression='brotli')
+
+        # Cloud storage
+        client = storage.Client()
+        bucket = client.get_bucket(BUCKET_NAME)
+        blob = bucket.blob(output_filename)
+        with open(OUTPUT_PATH + output_filename, 'rb') as pq_file:
+            blob.upload_from_file(pq_file)
+
         end = timer()
         os.remove(DEFAULT_PATH + wiki_file)
+        os.remove(OUTPUT_PATH + output_filename)
         print("Finished {} with shape {} in {} minutes".format(wiki_file,
                                                                arrow_table.shape, round((end - start) / 60, 2)))
         return wiki_file

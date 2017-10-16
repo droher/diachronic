@@ -1,7 +1,7 @@
 import yaml
 from enum import Enum
 
-with open("conf.yml", 'rb') as f:
+with open("diachronic/conf.yml", 'rb') as f:
     conf = yaml.load(f)
 
 

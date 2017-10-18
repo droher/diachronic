@@ -2,10 +2,9 @@ import json
 import os
 import shutil
 import urllib.request
-from functools import wraps
-from multiprocessing import Process, Semaphore
+from typing import Set, List
+from multiprocessing import Process, Semaphore, cpu_count, Pool
 from subprocess import Popen, PIPE
-from timeit import default_timer
 from dateutil.parser import parse as dateparse
 from datetime import datetime, timedelta
 import logging
@@ -17,6 +16,8 @@ import bsdiff4
 from google.cloud import storage
 
 from diachronic import conf, Tags
+
+DOWNLOAD_SEMAPHORE = Semaphore(conf["download"]["download_parallelism"])
 
 
 class BatchFileHandler(object):
@@ -31,45 +32,46 @@ class BatchFileHandler(object):
                                          download["month_source"])
 
         self.date_init = conf["run"]["datetime_init"]
-        self.download_parallelism = conf["download"]["download_parallelism"]
 
-    def get_filenames(self):
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    def get_filenames(self) -> Set[str]:
         json_url = urllib.request.urlopen("{}dumpstatus.json".format(self.url_prefix))
         data = json.loads(json_url.read().decode())
         json_url.close()
-        return list(data["jobs"]["metahistory7zdump"]["files"].keys())
+        return set(data["jobs"]["metahistory7zdump"]["files"].keys())
 
-    def download(self, wiki_file) -> None:
+    def get_files_to_skip(self) -> Set[str]:
+        client = storage.Client()
+        return {blob.name for blob in client.get_bucket(self.bucket).list_blobs()}
+
+    def get_files_to_run(self) -> Set[str]:
+        return {f for f in self.get_filenames()
+                if "{}.{}".format(f, self.output_suffix) in self.get_files_to_skip()}
+
+    def download(self, wiki_file: str) -> None:
+        logging.info("Downloading {}".format(wiki_file))
         response = urllib.request.urlopen(self.url_prefix + wiki_file)
         download_file = open(self.input_path + wiki_file, 'wb')
         shutil.copyfileobj(response, download_file)
         response.close()
         download_file.close()
+        logging.info("Downloaded {}".format(wiki_file))
 
-    def run_file(self, wiki_file, download_sem):
-        with download_sem:
-            print(wiki_file)
+    def run_file(self, wiki_file):
+        with DOWNLOAD_SEMAPHORE:
             self.download(wiki_file)
-        print("Downloaded", wiki_file)
-        parser = WikiParser(wiki_file)
+            parser = WikiParser(wiki_file)
         parser.run()
 
     def run(self):
-        # client = storage.Client()
-        # bucket = client.get_bucket(self.bucket)
-        filenames = self.get_filenames()
-        semaphore = Semaphore(2)
-        procs = [Process(target=self.run_file,
-                         args=(filename, semaphore))
-                 for filename in filenames[:4]]
-        for p in procs: p.start()
-        for p in procs: p.join()
-        # for filename in filenames:
-        #     if not bucket.blob(filename + ".parquet").exists():
-        #         pool.apply_async(self.run, (filename, ))
-        #     else:
-        #         print("Skipping", filename)
-
+        logging.info("Running")
+        filenames_to_run = self.get_filenames()
+        pool = Pool(4)
+        for f in filenames_to_run:
+            pool.apply_async(self.run_file, args=(f, ))
+        pool.close()
+        pool.join()
 
 class WikiParser(object):
     def __init__(self, wiki_file):
@@ -78,16 +80,14 @@ class WikiParser(object):
 
         self.wiki_file = wiki_file
 
-        self.datetime_init = dateparse(conf["run"]["datetime_init"])
+        self.datetime_init = conf["run"]["datetime_init"]
         self.bucket = conf["upload"]["gcloud_bucket"]
         self.input_path = conf["download"]["input_path"]
         self.output_path = conf["upload"]["output_path"]
-        self.output_file = self.wiki_file + conf["upload"]["output_suffix"]
+        self.output_file = "{}.{}".format(self.wiki_file, conf["upload"]["output_suffix"])
 
         self.arrow_buff = {colname: [] for colname in self.arrow_cols}
         self.arrow_row, self.cur_date, self.current_revision = self.iter_reset()
-
-        self.logger = logging.getLogger()
 
     def iter_reset(self):
         self.arrow_row = {colname: None for colname in self.arrow_cols}
@@ -102,16 +102,6 @@ class WikiParser(object):
             Tags.Namespace.nstag: self.parse_namespace,
             Tags.Page.nstag: self.parse_page,
         }
-
-    def timer(self, func):
-        start = default_timer()
-        @wraps(func)
-        def to_time(*args, **kwargs):
-            return func(*args, **kwargs)
-        end = default_timer()
-        mins = round((end - start) / 60, 2)
-        msg = "{}: {} finished in {} minutes".format(self.wiki_file, func.__name__, mins)
-        self.logger.info(msg)
 
     def parse_revision(self, elem) -> None:
         timestamp = dateparse(elem.find(Tags.Timestamp.nstag).text, ignoretz=True)
@@ -164,10 +154,10 @@ class WikiParser(object):
     def stream(self):
         stdout = Popen(["7z", "e", "-so", self.input_path + self.wiki_file], stdout=PIPE).stdout
         for event, elem in etree.iterparse(stdout, huge_tree=True):
-            self.func_dict[elem.tag](elem)
+            self.func_dict.get(elem.tag, lambda x: None)(elem)
 
     def run(self):
-        self.logger.info("Running", self.wiki_file)
+        logging.info("Running {}".format(self.wiki_file))
         self.stream()
         self.write()
         self.upload()

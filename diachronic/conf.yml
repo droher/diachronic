@@ -1,12 +1,12 @@
 download:
-  - input_path: "/tmp/wiki/input/"
-  - month_source: '20171001'
-  - url_prefix: "http://dumps.wikimedia.your.org/enwiki/"
-  - download_parallelism: False
+  input_path: "/tmp/wiki/input/"
+  month_source: '20171001'
+  url_prefix: "http://dumps.wikimedia.your.org/enwiki/"
+  download_parallelism: 2
 run:
-  - datetime_init: 2001-01-15 00:00:00
-  - namespace: "{http://www.mediawiki.org/xml/export-0.10/}"
+  datetime_init: 2001-01-15 00:00:00
+  namespace: "{http://www.mediawiki.org/xml/export-0.10/}"
 upload:
-  - output_path: "/tmp/wiki/output/"
-  - output_suffix: "parquet"
-  - gcloud_bucket: "poops"
+  output_path: "/tmp/wiki/output/"
+  output_suffix: "parquet"
+  gcloud_bucket: "poops"

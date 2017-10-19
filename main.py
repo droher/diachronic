@@ -2,17 +2,17 @@ import json
 import os
 import shutil
 import urllib.request
-from typing import Set, List
-from multiprocessing import Process, Semaphore, cpu_count, Pool
+from typing import List
+from multiprocessing import Semaphore, Pool
 from subprocess import Popen, PIPE
-from dateutil.parser import parse as dateparse
 from datetime import datetime, timedelta
 import logging
+import gc
+import psutil
 
 from lxml import etree
 import pyarrow as pa
 import pyarrow.parquet as pq
-import bsdiff4
 from google.cloud import storage
 
 from diachronic import conf, Tags
@@ -35,19 +35,21 @@ class BatchFileHandler(object):
 
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    def get_filenames(self) -> Set[str]:
+    def get_filenames(self) -> List[str]:
         json_url = urllib.request.urlopen("{}dumpstatus.json".format(self.url_prefix))
         data = json.loads(json_url.read().decode())
         json_url.close()
-        return set(data["jobs"]["metahistory7zdump"]["files"].keys())
+        return list(data["jobs"]["metahistory7zdump"]["files"].keys())
 
-    def get_files_to_skip(self) -> Set[str]:
+    def get_files_to_skip(self) -> List[str]:
         client = storage.Client()
-        return {blob.name for blob in client.get_bucket(self.bucket).list_blobs()}
+        return [blob.name for blob in client.get_bucket(self.bucket).list_blobs()]
 
-    def get_files_to_run(self) -> Set[str]:
-        return {f for f in self.get_filenames()
-                if "{}.{}".format(f, self.output_suffix) in self.get_files_to_skip()}
+    def get_files_to_run(self, overwrite=False) -> List[str]:
+        if overwrite:
+            return self.get_filenames()
+        return [f for f in self.get_filenames()
+                if "{}.{}".format(f, self.output_suffix) in self.get_files_to_skip()]
 
     def download(self, wiki_file: str) -> None:
         logging.info("Downloading {}".format(wiki_file))
@@ -66,17 +68,17 @@ class BatchFileHandler(object):
 
     def run(self):
         logging.info("Running")
-        filenames_to_run = self.get_filenames()
-        pool = Pool(4)
+        filenames_to_run = self.get_files_to_run(overwrite=True)
+        pool = Pool()
         for f in filenames_to_run:
             pool.apply_async(self.run_file, args=(f, ))
         pool.close()
         pool.join()
 
+
 class WikiParser(object):
     def __init__(self, wiki_file):
-        self.arrow_cols = ("namespace", "title", "initial_text",
-                           "initial_timestamp", "diff_timestamps", "diffs")
+        self.arrow_cols = ("namespace", "title", "timestamp", "text")
 
         self.wiki_file = wiki_file
 
@@ -88,6 +90,10 @@ class WikiParser(object):
 
         self.arrow_buff = {colname: [] for colname in self.arrow_cols}
         self.arrow_row, self.cur_date, self.current_revision = self.iter_reset()
+        self.buf_size = 0
+
+        self.schema = None
+        self.writer = None
 
     def iter_reset(self):
         self.arrow_row = {colname: None for colname in self.arrow_cols}
@@ -101,44 +107,49 @@ class WikiParser(object):
             Tags.Revision.nstag: self.parse_revision,
             Tags.Namespace.nstag: self.parse_namespace,
             Tags.Page.nstag: self.parse_page,
+            Tags.Title.nstag: self.parse_title
         }
 
-    def parse_revision(self, elem) -> None:
-        timestamp = dateparse(elem.find(Tags.Timestamp.nstag).text, ignoretz=True)
-        if timestamp >= self.cur_date and self.arrow_row["namespace"] == "0":
-            self.cur_date = datetime.combine(timestamp.date(), datetime.min.time()) + timedelta(days=1)
-            text = elem.find(Tags.Text.nstag).text or ""
-            text_bytes = bytes(text, "UTF-8")
-            if not self.current_revision:
-                self.current_revision = text_bytes
-                self.arrow_row["initial_text"] = text
-                self.arrow_row["initial_timestamp"] = timestamp
-                self.arrow_row["diff_timestamps"] = []
-                self.arrow_row["diffs"] = []
-            else:
-                self.arrow_row["diffs"].append(bsdiff4.diff(self.current_revision, text_bytes))
-                self.arrow_row["diff_timestamps"].append(timestamp)
-                self.current_revision = text_bytes
-            elem.clear()
+    def parse_title(self, elem) -> None:
+        self.arrow_row["title"] = elem.text
 
     def parse_namespace(self, elem) -> None:
         self.arrow_row["namespace"] = elem.text
 
-    def parse_page(self, elem) -> None:
-        self.arrow_row["title"] = elem.find(Tags.Title.nstag).text
-        if self.arrow_row["namespace"] == '0':
-            for col, val in self.arrow_row.items():
-                self.arrow_buff[col].append(val)
-        self.iter_reset()
-        while elem.getprevious() is not None:
-            del elem.getparent()[0]
-
+    def parse_revision(self, elem) -> None:
+        if self.arrow_row["namespace"] == "0":
+            timestamp = datetime.strptime(elem.find(Tags.Timestamp.nstag).text[:-1], "%Y-%m-%dT%H:%M:%S")
+            if timestamp >= self.cur_date:
+                self.cur_date = datetime.combine(timestamp.date(), datetime.min.time()) + timedelta(days=1)
+                text = elem.find(Tags.Text.nstag).text or ""
+                self.arrow_row["text"] = text
+                self.arrow_row["timestamp"] = timestamp
+                for col, val in self.arrow_row.items():
+                    self.buf_size += len(str(val))
+                    self.arrow_buff[col].append(val)
         elem.clear()
+
+    def parse_page(self, elem) -> None:
+        self.iter_reset()
+        if self.buf_size >= 1E9:
+            self.write()
+        elem.clear()
+
+    def stream(self):
+        stdout = Popen(["7z", "e", "-so", self.input_path + self.wiki_file], stdout=PIPE).stdout
+        for event, elem in etree.iterparse(stdout, huge_tree=True):
+            self.func_dict.get(elem.tag, lambda x: None)(elem)
 
     def write(self):
         arrow_arrays = {colname: pa.array(arr) for colname, arr in self.arrow_buff.items()}
         arrow_table = pa.Table.from_arrays(arrays=list(arrow_arrays.values()), names=list(arrow_arrays.keys()))
-        pq.write_table(arrow_table, self.output_path + self.output_file, compression='brotli')
+        if not self.writer:
+            self.writer = pq.ParquetWriter(self.output_path + self.output_file,
+                                           arrow_table.schema, compression='brotli')
+        self.writer.write_table(arrow_table)
+        self.arrow_buff = {colname: [] for colname in self.arrow_cols}
+        self.buf_size = 0
+        gc.collect()
 
     def upload(self):
         client = storage.Client()
@@ -151,19 +162,16 @@ class WikiParser(object):
         os.remove(self.input_path + self.wiki_file)
         os.remove(self.output_path + self.output_file)
 
-    def stream(self):
-        stdout = Popen(["7z", "e", "-so", self.input_path + self.wiki_file], stdout=PIPE).stdout
-        for event, elem in etree.iterparse(stdout, huge_tree=True):
-            self.func_dict.get(elem.tag, lambda x: None)(elem)
-
     def run(self):
-        logging.info("Running {}".format(self.wiki_file))
+        logging.info("Started parsing {}".format(self.wiki_file))
         self.stream()
-        self.write()
+        self.write() # Clear leftover buffer
+        self.writer.close()
         self.upload()
         self.cleanup()
+        logging.info("Finished parsing {}".format(self.wiki_file))
 
 
 if __name__ == "__main__":
-    handler = BatchFileHandler()
-    handler.run()
+    b = BatchFileHandler()
+    b.run()

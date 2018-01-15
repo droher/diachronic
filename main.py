@@ -2,13 +2,12 @@ import json
 import os
 import shutil
 import urllib.request
-from typing import List
+from typing import List, Dict, Tuple
 from multiprocessing import Semaphore, Pool
 from subprocess import Popen, PIPE
 from datetime import datetime, timedelta
 import logging
 import gc
-import psutil
 
 from lxml import etree
 import pyarrow as pa
@@ -95,14 +94,14 @@ class WikiParser(object):
         self.schema = None
         self.writer = None
 
-    def iter_reset(self):
+    def iter_reset(self) -> Tuple[Dict[str, None], datetime, None]:
         self.arrow_row = {colname: None for colname in self.arrow_cols}
         self.cur_date = self.datetime_init
         self.current_revision = None
         return self.arrow_row, self.cur_date, self.current_revision
 
     @property
-    def func_dict(self):
+    def func_dict(self) -> Dict[str, callable]:
         return {
             Tags.Revision.nstag: self.parse_revision,
             Tags.Namespace.nstag: self.parse_namespace,
@@ -135,12 +134,12 @@ class WikiParser(object):
             self.write()
         elem.clear()
 
-    def stream(self):
+    def stream(self) -> None:
         stdout = Popen(["7z", "e", "-so", self.input_path + self.wiki_file], stdout=PIPE).stdout
         for event, elem in etree.iterparse(stdout, huge_tree=True):
             self.func_dict.get(elem.tag, lambda x: None)(elem)
 
-    def write(self):
+    def write(self) -> None:
         arrow_arrays = {colname: pa.array(arr) for colname, arr in self.arrow_buff.items()}
         arrow_table = pa.Table.from_arrays(arrays=list(arrow_arrays.values()), names=list(arrow_arrays.keys()))
         if not self.writer:
@@ -151,21 +150,22 @@ class WikiParser(object):
         self.buf_size = 0
         gc.collect()
 
-    def upload(self):
+    def upload(self) -> None:
         client = storage.Client()
         bucket = client.get_bucket(self.bucket)
         blob = bucket.blob(self.output_file)
         with open(self.output_path + self.output_file, 'rb') as pq_file:
             blob.upload_from_file(pq_file)
 
-    def cleanup(self):
+    def cleanup(self) -> None:
         os.remove(self.input_path + self.wiki_file)
         os.remove(self.output_path + self.output_file)
 
-    def run(self):
+    def run(self) -> None:
         logging.info("Started parsing {}".format(self.wiki_file))
         self.stream()
-        self.write() # Clear leftover buffer
+        # Clear leftover buffer
+        self.write()
         self.writer.close()
         self.upload()
         self.cleanup()

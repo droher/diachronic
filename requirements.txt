@@ -1,4 +1,6 @@
-pyarrow==0.7.1
-bsdiff4==1.1.4
 lxml==4.0.0
-python_dateutil==2.6.1
+pyarrow==0.7.1
+psutil==5.4.0
+protobuf==3.4.0
+typing==3.6.2
+PyYAML==3.12

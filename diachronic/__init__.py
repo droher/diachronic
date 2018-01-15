@@ -1,8 +1,7 @@
-import yaml
+from diachronic.conf import GlobalConf
 from enum import Enum
 
-with open("diachronic/conf.yml", 'rb') as f:
-    conf = yaml.load(f)
+global_conf = GlobalConf()
 
 
 class Tags(Enum):
@@ -15,4 +14,4 @@ class Tags(Enum):
 
     @property
     def nstag(self) -> str:
-        return conf["run"]["namespace"] + self.value
+        return global_conf.namespace + self.value

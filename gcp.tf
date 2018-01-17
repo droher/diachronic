@@ -63,6 +63,7 @@ resource "google_compute_instance" "default" {
   provisioner "remote-exec" {
     inline = [
     "sudo apt-get -y install p7zip-full python3-pip",
+    "pip3 install --upgrade pip setuptools",
     "pip3 install -r ~/diachronic/requirements.txt"
     ]
     connection {

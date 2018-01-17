@@ -1,7 +1,7 @@
 # diachronic
 
 A parser that turns the revision history dump for a set of wiki sites 
-(e.g. Wikipeida, Wiktionary) into parquet files of daily snapshots.
+(e.g. Wikipedia, Wiktionary) into parquet files of daily snapshots.
 
 Uses Apache Arrow for serialization.
 

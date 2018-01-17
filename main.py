@@ -21,7 +21,7 @@ from diachronic import global_conf, Tags
 
 PROCESS_MEM = psutil.virtual_memory().total / psutil.cpu_count()
 # Fraction of (total_mem/cpu_count) that a given process uses before flushing buffer
-PROCESS_MEM_LIMIT = .95
+PROCESS_MEM_LIMIT = .1
 
 DOWNLOAD_SEMAPHORE = Semaphore(global_conf.download_parallelism)
 FAILURES = []

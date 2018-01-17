@@ -5,7 +5,7 @@ from typing import List
 
 class GlobalConf(object):
     def __init__(self):
-        with open("diachronic/conf.yml", 'rb') as f:
+        with open("./conf.yml", 'rb') as f:
             conf = yaml.load(f)
 
         self.wikis: List[str] = conf["wiki_info"]["wikis"]

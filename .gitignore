@@ -105,3 +105,9 @@ ENV/
 
 # Jetbrains
 .idea/
+
+# terraform
+account.json
+terraform.*
+.terraform*
+*.tfvars

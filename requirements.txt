@@ -1,4 +1,4 @@
-lxml==4.6.3
+lxml==4.9.1
 pyarrow==0.8.0
 protobuf==3.4.0
 typing==3.6.2
